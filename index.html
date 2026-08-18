@@ -11,7 +11,7 @@
     overflow: hidden;
     width: 100%;
     height: 100%;
-    background: #10141a;
+    background: #0c0d10;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
   }
   #renderCanvas {
@@ -24,14 +24,14 @@
     position: fixed;
     top: 16px;
     left: 16px;
-    background: rgba(20, 24, 32, 0.85);
+    background: rgba(18, 20, 26, 0.82);
     border: 1px solid rgba(255,255,255,0.12);
     border-radius: 10px;
     padding: 14px 18px;
     color: #e8ecf1;
     min-width: 240px;
     box-shadow: 0 8px 24px rgba(0,0,0,0.4);
-    backdrop-filter: blur(6px);
+    backdrop-filter: blur(8px);
   }
   #panel h1 {
     font-size: 15px;
@@ -76,16 +76,39 @@
     color: #7fd0ff;
     font-weight: 600;
   }
+  #quality {
+    width: 100%;
+    background: #1b1e26;
+    color: #e8ecf1;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 6px;
+    padding: 6px;
+    font-size: 12px;
+  }
   #hint {
     font-size: 11px;
     color: #7c8593;
     margin-top: 10px;
     line-height: 1.4;
   }
+  #loading {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #8a93a1;
+    font-size: 13px;
+    letter-spacing: 0.04em;
+    background: #0c0d10;
+    z-index: 5;
+    transition: opacity 0.4s ease;
+  }
 </style>
 </head>
 <body>
 <canvas id="renderCanvas"></canvas>
+<div id="loading">Cargando escena…</div>
 
 <div id="panel">
   <h1>Cinta Transportadora</h1>
@@ -100,8 +123,16 @@
     <input type="range" id="speed" min="0" max="3" step="0.1" value="1" />
   </div>
 
+  <div class="row">
+    <label for="quality">Calidad gráfica</label>
+    <select id="quality">
+      <option value="high">Alta (PC / móvil potente)</option>
+      <option value="medium">Media (móvil)</option>
+    </select>
+  </div>
+
   <div id="hint">
-    Arrastra para orbitar la cámara · rueda para zoom · clic derecho para desplazar
+    Arrastra para orbitar la cámara · rueda / pellizco para zoom · clic derecho o dos dedos para desplazar
   </div>
 </div>
 
@@ -110,16 +141,23 @@
 <script>
 "use strict";
 
+const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+
 const canvas = document.getElementById("renderCanvas");
-const engine = new BABYLON.Engine(canvas, true, { stencil: true, preserveDrawingBuffer: true });
+const engine = new BABYLON.Engine(canvas, true, {
+  stencil: true,
+  preserveDrawingBuffer: true,
+  antialias: true,
+  powerPreference: "high-performance",
+});
 
 // ---------------------------------------------------------------------------
 // Parámetros de la cinta transportadora
 // ---------------------------------------------------------------------------
 const CONVEYOR = {
-  length: 4.0,        // eje X
-  width: 1.0,          // eje Z
-  topHeight: 0.8,       // altura de la superficie superior de la cinta desde el suelo
+  length: 4.0,          // eje X
+  width: 1.0,            // eje Z
+  topHeight: 0.8,         // altura de la superficie superior de la cinta desde el suelo
   rollerRadius: 0.09,
   legSize: 0.08,
   guideHeight: 0.12,
@@ -129,81 +167,441 @@ const CONVEYOR = {
 let beltRunning = true;
 let beltSpeed = 1.0; // m/s (velocidad lineal aproximada de la cinta)
 
-function createScene() {
+// ---------------------------------------------------------------------------
+// Utilidades de ruido / generación procedural de texturas
+// ---------------------------------------------------------------------------
+function hash2(x, y) {
+  const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
+  return s - Math.floor(s);
+}
+
+function smoothNoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = xf * xf * (3 - 2 * xf);
+  const v = yf * yf * (3 - 2 * yf);
+  const a = hash2(xi, yi), b = hash2(xi + 1, yi);
+  const c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+
+function fbm(x, y, octaves) {
+  let total = 0, amp = 0.5, freq = 1, max = 0;
+  for (let i = 0; i < octaves; i++) {
+    total += smoothNoise(x * freq, y * freq) * amp;
+    max += amp;
+    amp *= 0.5;
+    freq *= 2.1;
+  }
+  return total / max;
+}
+
+// Convierte un campo de alturas (función u,v -> escalar) en un mapa de normales,
+// para dar relieve real (bump) a texturas proceduralmente generadas.
+function heightFieldToNormalMap(scene, name, size, heightFn, strength) {
+  const tex = new BABYLON.DynamicTexture(name, { width: size, height: size }, scene, false);
+  const ctx = tex.getContext();
+  const img = ctx.createImageData(size, size);
+  const e = 1 / size;
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size, v = y / size;
+      const hL = heightFn(u - e, v);
+      const hR = heightFn(u + e, v);
+      const hD = heightFn(u, v - e);
+      const hU = heightFn(u, v + e);
+      let nx = -(hR - hL) * strength;
+      let ny = -(hU - hD) * strength;
+      let nz = 1.0;
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      nx /= len; ny /= len; nz /= len;
+      const idx = (y * size + x) * 4;
+      img.data[idx] = (nx * 0.5 + 0.5) * 255;
+      img.data[idx + 1] = (ny * 0.5 + 0.5) * 255;
+      img.data[idx + 2] = (nz * 0.5 + 0.5) * 255;
+      img.data[idx + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  tex.update(false);
+  tex.wrapU = BABYLON.Texture.WRAP_ADDRESSMODE;
+  tex.wrapV = BABYLON.Texture.WRAP_ADDRESSMODE;
+  return tex;
+}
+
+// ---------------------------------------------------------------------------
+// Materiales PBR
+// ---------------------------------------------------------------------------
+let beltMaterial;
+let beltNormalTexture;
+
+function beltHeight(u, v) {
+  // Nervios diagonales tipo "chevron" propios de una banda transportadora real
+  const freq = 26;
+  const phase = (u + v * 0.35) * freq * Math.PI * 2;
+  const rib = Math.pow(Math.max(0, Math.sin(phase)), 3);
+  return rib * 0.6 + fbm(u * 40, v * 40, 2) * 0.08;
+}
+
+function createRubberBeltMaterial(scene, quality) {
+  const size = quality === "high" ? 512 : 256;
+
+  const albedo = new BABYLON.DynamicTexture("beltAlbedo", { width: size, height: size }, scene, false);
+  const actx = albedo.getContext();
+  const grad = actx.createLinearGradient(0, 0, 0, size);
+  grad.addColorStop(0, "#1c1c1e");
+  grad.addColorStop(1, "#131315");
+  actx.fillStyle = grad;
+  actx.fillRect(0, 0, size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size, v = y / size;
+      const h = beltHeight(u, v);
+      if (h > 0.25) {
+        const shade = 30 + h * 55;
+        actx.fillStyle = `rgba(${shade},${shade},${shade + 2},${Math.min(1, h)})`;
+        actx.fillRect(x, y, 1, 1);
+      }
+    }
+  }
+  // polvo / desgaste sutil
+  for (let i = 0; i < size * 8; i++) {
+    const x = Math.random() * size, y = Math.random() * size;
+    const a = Math.random() * 0.05;
+    actx.fillStyle = `rgba(90,85,80,${a})`;
+    actx.fillRect(x, y, 1.5, 1.5);
+  }
+  albedo.update(false);
+  albedo.wrapU = BABYLON.Texture.WRAP_ADDRESSMODE;
+  albedo.wrapV = BABYLON.Texture.WRAP_ADDRESSMODE;
+
+  beltNormalTexture = heightFieldToNormalMap(scene, "beltNormal", size, beltHeight, 2.2);
+
+  const mat = new BABYLON.PBRMaterial("beltMat", scene);
+  mat.albedoTexture = albedo;
+  mat.bumpTexture = beltNormalTexture;
+  mat.bumpTexture.level = 1.0;
+  mat.metallic = 0.0;
+  mat.roughness = 0.85;
+  mat.environmentIntensity = 0.5;
+  [albedo, beltNormalTexture].forEach((t) => {
+    t.uScale = 10;
+    t.vScale = 1;
+  });
+
+  beltMaterial = mat;
+  return mat;
+}
+
+function brushedHeight(u, v) {
+  return fbm(u * 2, v * 220, 1) * 0.5 + fbm(u * 60, v * 60, 3) * 0.15;
+}
+
+function createMetalMaterial(scene, name, colorHex, roughness, metallic, quality) {
+  const size = quality === "high" ? 256 : 128;
+  const color = BABYLON.Color3.FromHexString(colorHex);
+
+  const albedo = new BABYLON.DynamicTexture(name + "Albedo", { width: size, height: size }, scene, false);
+  const actx = albedo.getContext();
+  actx.fillStyle = colorHex;
+  actx.fillRect(0, 0, size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const n = fbm(x * 0.15, y * 1.2, 2);
+      const shade = (n - 0.5) * 18;
+      const r = Math.min(255, Math.max(0, color.r * 255 + shade));
+      const g = Math.min(255, Math.max(0, color.g * 255 + shade));
+      const b = Math.min(255, Math.max(0, color.b * 255 + shade));
+      actx.fillStyle = `rgb(${r|0},${g|0},${b|0})`;
+      actx.fillRect(x, y, 1, 1);
+    }
+  }
+  albedo.update(false);
+
+  const normal = heightFieldToNormalMap(scene, name + "Normal", size, brushedHeight, 1.4);
+
+  const mat = new BABYLON.PBRMaterial(name, scene);
+  mat.albedoTexture = albedo;
+  mat.bumpTexture = normal;
+  mat.metallic = metallic;
+  mat.roughness = roughness;
+  mat.environmentIntensity = 0.9;
+  return mat;
+}
+
+function createSafetyStripeMaterial(scene, quality) {
+  const size = quality === "high" ? 512 : 256;
+  const tex = new BABYLON.DynamicTexture("stripeTex", { width: size, height: size }, scene, false);
+  const ctx = tex.getContext();
+  ctx.fillStyle = "#f4c421";
+  ctx.fillRect(0, 0, size, size);
+  ctx.fillStyle = "#181818";
+  const stripeW = size / 6;
+  ctx.save();
+  ctx.translate(size / 2, size / 2);
+  ctx.rotate(Math.PI / 4);
+  ctx.translate(-size, -size);
+  for (let x = 0; x < size * 3; x += stripeW * 2) {
+    ctx.fillRect(x, 0, stripeW, size * 2);
+  }
+  ctx.restore();
+  // suciedad / rozaduras
+  for (let i = 0; i < 400; i++) {
+    const x = Math.random() * size, y = Math.random() * size;
+    ctx.fillStyle = `rgba(20,20,20,${Math.random() * 0.15})`;
+    ctx.fillRect(x, y, 2, 2);
+  }
+  tex.update(false);
+  tex.uScale = 4;
+  tex.vScale = 1;
+
+  const mat = new BABYLON.PBRMaterial("safetyMat", scene);
+  mat.albedoTexture = tex;
+  mat.metallic = 0.05;
+  mat.roughness = 0.55;
+  mat.environmentIntensity = 0.6;
+  return mat;
+}
+
+function createConcreteMaterial(scene, quality) {
+  const size = quality === "high" ? 512 : 256;
+  const tex = new BABYLON.DynamicTexture("concreteTex", { width: size, height: size }, scene, false);
+  const ctx = tex.getContext();
+  const img = ctx.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size, v = y / size;
+      const n = fbm(u * 6, v * 6, 4);
+      const base = 150 + n * 55;
+      const idx = (y * size + x) * 4;
+      img.data[idx] = base;
+      img.data[idx + 1] = base + 1;
+      img.data[idx + 2] = base + 2;
+      img.data[idx + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  // juntas de dilatación
+  ctx.strokeStyle = "rgba(90,90,92,0.5)";
+  ctx.lineWidth = 2;
+  for (let i = 1; i < 6; i++) {
+    ctx.beginPath();
+    ctx.moveTo((size / 6) * i, 0);
+    ctx.lineTo((size / 6) * i, size);
+    ctx.stroke();
+  }
+  tex.update(false);
+  tex.uScale = 6;
+  tex.vScale = 6;
+  tex.wrapU = BABYLON.Texture.WRAP_ADDRESSMODE;
+  tex.wrapV = BABYLON.Texture.WRAP_ADDRESSMODE;
+
+  function concreteHeight(u, v) {
+    return fbm(u * 6, v * 6, 4) * 0.3;
+  }
+  const normal = heightFieldToNormalMap(scene, "concreteNormal", size, concreteHeight, 1.0);
+  normal.uScale = 6;
+  normal.vScale = 6;
+  normal.wrapU = BABYLON.Texture.WRAP_ADDRESSMODE;
+  normal.wrapV = BABYLON.Texture.WRAP_ADDRESSMODE;
+
+  const mat = new BABYLON.PBRMaterial("concreteMat", scene);
+  mat.albedoTexture = tex;
+  mat.bumpTexture = normal;
+  mat.metallic = 0.0;
+  mat.roughness = 0.95;
+  mat.environmentIntensity = 0.4;
+  return mat;
+}
+
+function createCardboardMaterial(scene, quality, hueShift) {
+  const size = quality === "high" ? 256 : 128;
+  const tex = new BABYLON.DynamicTexture("cardboardTex" + hueShift, { width: size, height: size }, scene, false);
+  const ctx = tex.getContext();
+  const base = `hsl(${30 + hueShift}, 35%, ${48 + hueShift}%)`;
+  ctx.fillStyle = base;
+  ctx.fillRect(0, 0, size, size);
+  ctx.strokeStyle = `hsla(30, 30%, 25%, 0.35)`;
+  ctx.lineWidth = 1;
+  for (let y = 4; y < size; y += 6) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(size, y);
+    ctx.stroke();
+  }
+  // cinta adhesiva central
+  ctx.fillStyle = "rgba(230,220,190,0.55)";
+  ctx.fillRect(0, size * 0.42, size, size * 0.16);
+  tex.update(false);
+
+  const mat = new BABYLON.PBRMaterial("cardboardMat" + hueShift, scene);
+  mat.albedoTexture = tex;
+  mat.metallic = 0.0;
+  mat.roughness = 0.92;
+  mat.environmentIntensity = 0.4;
+  return mat;
+}
+
+// Entorno de reflexión IBL generado 100% por código (sin depender de ningún
+// CDN externo): un degradado tipo estudio con un "cielo" claro arriba y
+// suelo oscuro abajo, suficiente para dar reflejos creíbles al metal.
+function createStudioEnvironmentTexture(scene) {
+  const size = 128;
+  function face(topColor, bottomColor) {
+    const c = document.createElement("canvas");
+    c.width = size; c.height = size;
+    const ctx = c.getContext("2d");
+    const g = ctx.createLinearGradient(0, 0, 0, size);
+    g.addColorStop(0, topColor);
+    g.addColorStop(1, bottomColor);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
+    return c.toDataURL("image/png");
+  }
+  const sky = "#cfd8e3";
+  const horizon = "#8a8f96";
+  const ground = "#2a2c30";
+  const urls = [
+    face(horizon, ground), // px
+    face(horizon, ground), // nx
+    face(sky, horizon),    // py (arriba)
+    face(ground, ground),  // ny (abajo)
+    face(horizon, ground), // pz
+    face(horizon, ground), // nz
+  ];
+  const cube = BABYLON.CubeTexture.CreateFromImages(urls, scene);
+  cube.gammaSpace = false;
+  return cube;
+}
+
+// ---------------------------------------------------------------------------
+// Escena
+// ---------------------------------------------------------------------------
+function createScene(quality) {
   const scene = new BABYLON.Scene(engine);
-  scene.clearColor = new BABYLON.Color3(0.06, 0.07, 0.09);
+  scene.clearColor = new BABYLON.Color4(0.05, 0.055, 0.065, 1);
+
+  scene.environmentTexture = createStudioEnvironmentTexture(scene);
+  scene.environmentIntensity = 0.7;
+
+  scene.fogMode = BABYLON.Scene.FOGMODE_LINEAR;
+  scene.fogStart = 8;
+  scene.fogEnd = 22;
+  scene.fogColor = new BABYLON.Color3(0.09, 0.095, 0.1);
+
+  scene.imageProcessingConfiguration.toneMappingEnabled = true;
+  scene.imageProcessingConfiguration.toneMappingType = BABYLON.ImageProcessingConfiguration.TONEMAPPING_ACES;
+  scene.imageProcessingConfiguration.exposure = 1.15;
+  scene.imageProcessingConfiguration.contrast = 1.15;
 
   // --- Cámara ---
   const camera = new BABYLON.ArcRotateCamera(
     "camera",
     -Math.PI / 2.6,
-    Math.PI / 2.7,
-    6.5,
+    Math.PI / 2.55,
+    6.0,
     new BABYLON.Vector3(0, 0.5, 0),
     scene
   );
   camera.attachControl(canvas, true);
-  camera.lowerRadiusLimit = 2;
+  camera.lowerRadiusLimit = 1.8;
   camera.upperRadiusLimit = 14;
+  camera.upperBetaLimit = Math.PI / 2.02;
   camera.wheelPrecision = 40;
+  camera.pinchPrecision = 80;
   camera.panningSensibility = 800;
+  camera.fov = 0.75;
+  camera.minZ = 0.05;
 
-  // --- Luces ---
+  // --- Luces (montaje de 3 puntos) ---
   const hemi = new BABYLON.HemisphericLight("hemi", new BABYLON.Vector3(0, 1, 0), scene);
-  hemi.intensity = 0.75;
-  hemi.groundColor = new BABYLON.Color3(0.15, 0.15, 0.18);
+  hemi.intensity = 0.35;
+  hemi.groundColor = new BABYLON.Color3(0.12, 0.12, 0.14);
+  hemi.specular = new BABYLON.Color3(0, 0, 0);
 
-  const sun = new BABYLON.DirectionalLight("sun", new BABYLON.Vector3(-0.6, -1, 0.4), scene);
+  const sun = new BABYLON.DirectionalLight("sun", new BABYLON.Vector3(-0.55, -1, 0.35), scene);
   sun.position = new BABYLON.Vector3(5, 8, -5);
-  sun.intensity = 0.9;
+  sun.intensity = 2.2;
+  sun.diffuse = new BABYLON.Color3(1.0, 0.98, 0.92);
 
-  const shadowGen = new BABYLON.ShadowGenerator(1024, sun);
+  const fill = new BABYLON.DirectionalLight("fill", new BABYLON.Vector3(0.7, -0.4, -0.6), scene);
+  fill.intensity = 0.45;
+  fill.diffuse = new BABYLON.Color3(0.75, 0.82, 1.0);
+  fill.specular = new BABYLON.Color3(0, 0, 0);
+
+  const rim = new BABYLON.DirectionalLight("rim", new BABYLON.Vector3(-0.3, -0.2, 1), scene);
+  rim.intensity = 0.6;
+  rim.diffuse = new BABYLON.Color3(0.85, 0.9, 1.0);
+
+  const shadowMapSize = quality === "high" ? 2048 : 1024;
+  const shadowGen = new BABYLON.ShadowGenerator(shadowMapSize, sun);
   shadowGen.useBlurExponentialShadowMap = true;
-  shadowGen.blurKernel = 16;
+  shadowGen.blurKernel = quality === "high" ? 24 : 12;
+  shadowGen.darkness = 0.25;
+  shadowGen.bias = 0.0015;
+  shadowGen.normalBias = 0.02;
 
-  // --- Suelo ---
-  const ground = BABYLON.MeshBuilder.CreateGround("ground", { width: 12, height: 12 }, scene);
-  const groundMat = new BABYLON.StandardMaterial("groundMat", scene);
-  groundMat.diffuseColor = new BABYLON.Color3(0.18, 0.19, 0.21);
-  groundMat.specularColor = new BABYLON.Color3(0.02, 0.02, 0.02);
-  ground.material = groundMat;
+  // --- Suelo de hormigón ---
+  const ground = BABYLON.MeshBuilder.CreateGround("ground", { width: 16, height: 16 }, scene);
+  ground.material = createConcreteMaterial(scene, quality);
   ground.receiveShadows = true;
 
-  // Rejilla de referencia (líneas cada 0.5 m)
-  const grid = BABYLON.MeshBuilder.CreateGround("gridLines", { width: 12, height: 12, subdivisions: 24 }, scene);
-  grid.position.y = 0.001;
-  const gridMat = new BABYLON.StandardMaterial("gridMat", scene);
-  gridMat.wireframe = true;
-  gridMat.emissiveColor = new BABYLON.Color3(0.25, 0.27, 0.3);
-  gridMat.alpha = 0.25;
-  grid.material = gridMat;
+  // --- Pared de fondo tipo nave industrial ---
+  const wall = BABYLON.MeshBuilder.CreatePlane("wall", { width: 16, height: 5, sideOrientation: BABYLON.Mesh.DOUBLESIDE }, scene);
+  wall.position.set(0, 2.5, 6);
+  const wallMat = createMetalMaterial(scene, "wallMat", "#4a5058", 0.6, 0.15, quality);
+  wallMat.albedoTexture.uScale = 8;
+  wall.material = wallMat;
+  wall.receiveShadows = true;
 
   // --- Grupo raíz de la cinta ---
   const conveyorRoot = new BABYLON.TransformNode("conveyorRoot", scene);
-
-  const parts = buildConveyor(scene, shadowGen);
+  const parts = buildConveyor(scene, shadowGen, quality);
   parts.forEach((m) => (m.parent = conveyorRoot));
 
-  // --- Cajas de ejemplo que se mueven sobre la cinta (para visualizar la simulación) ---
-  const boxes = createSimulationBoxes(scene, shadowGen);
+  // --- Cajas de ejemplo que se mueven sobre la cinta ---
+  const boxes = createSimulationBoxes(scene, shadowGen, quality);
+
+  // --- Post-proceso ---
+  const pipeline = new BABYLON.DefaultRenderingPipeline("defaultPipeline", true, scene, [camera]);
+  pipeline.bloomEnabled = true;
+  pipeline.bloomThreshold = 0.75;
+  pipeline.bloomWeight = 0.35;
+  pipeline.bloomKernel = quality === "high" ? 64 : 32;
+  pipeline.fxaaEnabled = true;
+  pipeline.sharpenEnabled = true;
+  pipeline.sharpen.edgeAmount = 0.25;
+  pipeline.grainEnabled = quality === "high";
+  if (pipeline.grain) pipeline.grain.intensity = 6;
+  pipeline.imageProcessing.vignetteEnabled = true;
+  pipeline.imageProcessing.vignetteWeight = 1.2;
+  pipeline.imageProcessing.vignetteStretch = 0.4;
+
+  if (quality === "high" && BABYLON.SSAO2RenderingPipeline.IsSupported) {
+    const ssao = new BABYLON.SSAO2RenderingPipeline("ssao", scene, {
+      ssaoRatio: 0.5,
+      blurRatio: 0.5,
+    }, [camera]);
+    ssao.radius = 1.2;
+    ssao.totalStrength = 1.1;
+    ssao.expensiveBlur = false;
+    ssao.samples = 16;
+    ssao.maxZ = 12;
+  }
 
   // --- Loop de animación ---
-  let beltPhase = 0;
   scene.onBeforeRenderObservable.add(() => {
     const dt = engine.getDeltaTime() / 1000;
     if (beltRunning) {
-      beltPhase += beltSpeed * dt;
-
-      // Girar rodillos: velocidad angular = v / r
       const angular = beltSpeed / CONVEYOR.rollerRadius;
       rollerMeshes.forEach((r) => r.rotate(BABYLON.Axis.Y, angular * dt, BABYLON.Space.LOCAL));
 
-      // Desplazar textura de la cinta para dar sensación de movimiento
-      if (beltMaterial.diffuseTexture) {
-        beltMaterial.diffuseTexture.uOffset += (beltSpeed * dt) / CONVEYOR.length;
+      if (beltMaterial.albedoTexture) {
+        beltMaterial.albedoTexture.uOffset += (beltSpeed * dt) / CONVEYOR.length;
+        beltNormalTexture.uOffset += (beltSpeed * dt) / CONVEYOR.length;
       }
 
-      // Mover cajas de simulación a lo largo de la cinta
       updateSimulationBoxes(boxes, beltSpeed * dt);
     }
   });
@@ -215,35 +613,26 @@ function createScene() {
 // Construcción geométrica de la cinta transportadora
 // ---------------------------------------------------------------------------
 let rollerMeshes = [];
-let beltMaterial;
 
-function buildConveyor(scene, shadowGen) {
+function buildConveyor(scene, shadowGen, quality) {
   const { length, width, topHeight, rollerRadius, legSize } = CONVEYOR;
   const meshes = [];
 
-  const centerDist = length - 2 * rollerRadius; // distancia entre centros de rodillos
+  const centerDist = length - 2 * rollerRadius;
   const rollerCenterY = topHeight - rollerRadius;
 
-  // --- Material de metal (bastidor) ---
-  const frameMat = new BABYLON.StandardMaterial("frameMat", scene);
-  frameMat.diffuseColor = new BABYLON.Color3(0.25, 0.27, 0.3);
-  frameMat.specularColor = new BABYLON.Color3(0.3, 0.3, 0.3);
-  frameMat.specularPower = 32;
+  const frameMat = createMetalMaterial(scene, "frameMat", "#3a4048", 0.4, 0.85, quality);
+  const rollerMat = createMetalMaterial(scene, "rollerMat", "#9096a0", 0.28, 0.9, quality);
+  const boltMat = createMetalMaterial(scene, "boltMat", "#20232a", 0.35, 0.9, quality);
+  const rubberLagMat = new BABYLON.PBRMaterial("rubberLagMat", scene);
+  rubberLagMat.albedoColor = new BABYLON.Color3(0.05, 0.05, 0.055);
+  rubberLagMat.metallic = 0;
+  rubberLagMat.roughness = 0.9;
 
-  // --- Material de rodillos ---
-  const rollerMat = new BABYLON.StandardMaterial("rollerMat", scene);
-  rollerMat.diffuseColor = new BABYLON.Color3(0.55, 0.56, 0.58);
-  rollerMat.specularColor = new BABYLON.Color3(0.6, 0.6, 0.6);
-
-  // --- Material de la banda (goma con rayas en movimiento) ---
-  beltMaterial = new BABYLON.StandardMaterial("beltMat", scene);
-  beltMaterial.diffuseTexture = createBeltTexture(scene);
-  beltMaterial.diffuseTexture.uScale = 8;
-  beltMaterial.diffuseTexture.vScale = 1;
-  beltMaterial.specularColor = new BABYLON.Color3(0.08, 0.08, 0.08);
+  const beltMat = createRubberBeltMaterial(scene, quality);
 
   // --- Banda (loop tipo estadio extruido a lo ancho) ---
-  const beltShape = createStadiumProfile(centerDist, rollerRadius, 20);
+  const beltShape = createStadiumProfile(centerDist, rollerRadius, 24);
   const path = [
     new BABYLON.Vector3(0, 0, -width / 2),
     new BABYLON.Vector3(0, 0, width / 2),
@@ -256,18 +645,18 @@ function buildConveyor(scene, shadowGen) {
     sideOrientation: BABYLON.Mesh.DOUBLESIDE,
   }, scene);
   belt.position.y = rollerCenterY;
-  belt.material = beltMaterial;
+  belt.material = beltMat;
   belt.receiveShadows = true;
   shadowGen.addShadowCaster(belt);
   meshes.push(belt);
 
-  // --- Rodillos (extremos) ---
+  // --- Rodillos (extremos), con núcleo metálico + "lagging" de goma en los bordes ---
   rollerMeshes = [];
   [-1, 1].forEach((side) => {
     const roller = BABYLON.MeshBuilder.CreateCylinder("roller", {
       diameter: rollerRadius * 2,
       height: width,
-      tessellation: 24,
+      tessellation: quality === "high" ? 32 : 20,
     }, scene);
     roller.rotation.x = Math.PI / 2;
     roller.position.set((side * centerDist) / 2, rollerCenterY, 0);
@@ -276,9 +665,22 @@ function buildConveyor(scene, shadowGen) {
     shadowGen.addShadowCaster(roller);
     meshes.push(roller);
     rollerMeshes.push(roller);
+
+    [-1, 1].forEach((edge) => {
+      const ring = BABYLON.MeshBuilder.CreateCylinder("rollerRing", {
+        diameter: rollerRadius * 2 + 0.004,
+        height: 0.03,
+        tessellation: quality === "high" ? 32 : 20,
+      }, scene);
+      ring.rotation.x = Math.PI / 2;
+      ring.position.set(roller.position.x, rollerCenterY, edge * (width / 2 - 0.05));
+      ring.material = rubberLagMat;
+      ring.parent = roller;
+      meshes.push(ring);
+    });
   });
 
-  // --- Patas (4 esquinas) ---
+  // --- Patas (4 esquinas) con placas de base ---
   const legHeight = rollerCenterY - rollerRadius;
   const legOffsetX = centerDist / 2;
   const legOffsetZ = width / 2 - legSize;
@@ -293,10 +695,23 @@ function buildConveyor(scene, shadowGen) {
       leg.material = frameMat;
       shadowGen.addShadowCaster(leg);
       meshes.push(leg);
+
+      const basePlate = BABYLON.MeshBuilder.CreateBox("basePlate", {
+        width: legSize * 2.2,
+        height: 0.012,
+        depth: legSize * 2.2,
+      }, scene);
+      basePlate.position.set(sx * legOffsetX, 0.006, sz * legOffsetZ);
+      basePlate.material = boltMat;
+      basePlate.receiveShadows = true;
+      shadowGen.addShadowCaster(basePlate);
+      meshes.push(basePlate);
+
+      addBolts(scene, meshes, basePlate.position.x, 0.013, basePlate.position.z, legSize * 0.8, boltMat, quality);
     });
   });
 
-  // --- Largueros longitudinales (unen las patas a lo largo) ---
+  // --- Largueros longitudinales ---
   [-1, 1].forEach((sz) => {
     const rail = BABYLON.MeshBuilder.CreateBox("rail", {
       width: centerDist + legSize,
@@ -309,7 +724,7 @@ function buildConveyor(scene, shadowGen) {
     meshes.push(rail);
   });
 
-  // --- Traviesas transversales (unen ambos lados) ---
+  // --- Traviesas transversales ---
   [-1, 0, 1].forEach((sx) => {
     const brace = BABYLON.MeshBuilder.CreateBox("brace", {
       width: legSize * 0.7,
@@ -322,10 +737,8 @@ function buildConveyor(scene, shadowGen) {
     meshes.push(brace);
   });
 
-  // --- Guías laterales (evitan que las cajas caigan) ---
-  const guideMat = new BABYLON.StandardMaterial("guideMat", scene);
-  guideMat.diffuseColor = new BABYLON.Color3(0.85, 0.55, 0.1);
-  guideMat.alpha = 0.85;
+  // --- Guías laterales con franjas de seguridad ---
+  const safetyMat = createSafetyStripeMaterial(scene, quality);
   const guideY = topHeight + CONVEYOR.guideHeight / 2;
   [-1, 1].forEach((sz) => {
     const guide = BABYLON.MeshBuilder.CreateBox("guide", {
@@ -334,12 +747,88 @@ function buildConveyor(scene, shadowGen) {
       depth: CONVEYOR.guideThickness,
     }, scene);
     guide.position.set(0, guideY, sz * (width / 2));
-    guide.material = guideMat;
+    guide.material = safetyMat;
     shadowGen.addShadowCaster(guide);
     meshes.push(guide);
+
+    // soportes verticales de la guía
+    for (let i = -1; i <= 1; i++) {
+      const bracket = BABYLON.MeshBuilder.CreateBox("bracket", {
+        width: 0.02,
+        height: CONVEYOR.guideHeight + 0.06,
+        depth: 0.02,
+      }, scene);
+      bracket.position.set(i * (length / 2.5), topHeight + (CONVEYOR.guideHeight + 0.06) / 2 - 0.05, sz * (width / 2));
+      bracket.material = frameMat;
+      shadowGen.addShadowCaster(bracket);
+      meshes.push(bracket);
+    }
   });
 
+  // --- Grupo motorreductor + polea de accionamiento (extremo derecho) ---
+  const motorX = centerDist / 2 + rollerRadius * 1.4;
+  const motorY = rollerCenterY - 0.05;
+  const motorBody = BABYLON.MeshBuilder.CreateCylinder("motorBody", {
+    diameter: 0.16,
+    height: 0.28,
+    tessellation: quality === "high" ? 24 : 16,
+  }, scene);
+  motorBody.rotation.x = Math.PI / 2;
+  motorBody.position.set(motorX, motorY, width / 2 + 0.22);
+  motorBody.material = createMetalMaterial(scene, "motorMat", "#2f6b3d", 0.5, 0.4, quality);
+  shadowGen.addShadowCaster(motorBody);
+  meshes.push(motorBody);
+
+  // aletas de refrigeración del motor
+  for (let i = 0; i < 8; i++) {
+    const fin = BABYLON.MeshBuilder.CreateTorus("fin", {
+      diameter: 0.17,
+      thickness: 0.006,
+      tessellation: quality === "high" ? 24 : 16,
+    }, scene);
+    fin.rotation.x = Math.PI / 2;
+    fin.position.set(motorX, motorY, width / 2 + 0.1 + i * 0.028);
+    fin.material = motorBody.material;
+    meshes.push(fin);
+  }
+
+  const reducer = BABYLON.MeshBuilder.CreateBox("reducer", { width: 0.12, height: 0.12, depth: 0.1 }, scene);
+  reducer.position.set(motorX, motorY, width / 2 + 0.02);
+  reducer.material = motorBody.material;
+  shadowGen.addShadowCaster(reducer);
+  meshes.push(reducer);
+
+  const coupling = BABYLON.MeshBuilder.CreateCylinder("coupling", {
+    diameter: rollerRadius * 1.6,
+    height: 0.05,
+    tessellation: quality === "high" ? 24 : 16,
+  }, scene);
+  coupling.rotation.x = Math.PI / 2;
+  coupling.position.set(centerDist / 2, rollerCenterY, width / 2 + 0.02);
+  coupling.material = boltMat;
+  shadowGen.addShadowCaster(coupling);
+  meshes.push(coupling);
+
   return meshes;
+}
+
+function addBolts(scene, meshes, x, y, z, spread, material, quality) {
+  const offsets = [
+    [-spread / 2, -spread / 2],
+    [spread / 2, -spread / 2],
+    [-spread / 2, spread / 2],
+    [spread / 2, spread / 2],
+  ];
+  offsets.forEach(([dx, dz]) => {
+    const bolt = BABYLON.MeshBuilder.CreateCylinder("bolt", {
+      diameter: 0.012,
+      height: 0.01,
+      tessellation: 6,
+    }, scene);
+    bolt.position.set(x + dx, y, z + dz);
+    bolt.material = material;
+    meshes.push(bolt);
+  });
 }
 
 // Genera el perfil 2D en forma de "pista de atletismo" (estadio) que envuelve
@@ -348,21 +837,17 @@ function createStadiumProfile(centerDist, radius, segments) {
   const pts = [];
   const half = centerDist / 2;
 
-  // borde superior recto (de derecha a izquierda)
   pts.push(new BABYLON.Vector3(half, radius, 0));
   pts.push(new BABYLON.Vector3(-half, radius, 0));
 
-  // semicírculo izquierdo (90° -> 270°)
   for (let i = 0; i <= segments; i++) {
     const a = Math.PI / 2 + (Math.PI * i) / segments;
     pts.push(new BABYLON.Vector3(-half + radius * Math.cos(a), radius * Math.sin(a), 0));
   }
 
-  // borde inferior recto (de izquierda a derecha)
   pts.push(new BABYLON.Vector3(-half, -radius, 0));
   pts.push(new BABYLON.Vector3(half, -radius, 0));
 
-  // semicírculo derecho (-90° -> 90°)
   for (let i = 0; i <= segments; i++) {
     const a = -Math.PI / 2 + (Math.PI * i) / segments;
     pts.push(new BABYLON.Vector3(half + radius * Math.cos(a), radius * Math.sin(a), 0));
@@ -371,57 +856,28 @@ function createStadiumProfile(centerDist, radius, segments) {
   return pts;
 }
 
-// Textura procedural con rayas diagonales para dar sensación de movimiento a la banda
-function createBeltTexture(scene) {
-  const size = 256;
-  const tex = new BABYLON.DynamicTexture("beltTex", { width: size, height: size }, scene, false);
-  const ctx = tex.getContext();
-
-  ctx.fillStyle = "#1b1b1d";
-  ctx.fillRect(0, 0, size, size);
-
-  ctx.strokeStyle = "#333336";
-  ctx.lineWidth = 10;
-  const step = 32;
-  for (let x = -size; x < size * 2; x += step) {
-    ctx.beginPath();
-    ctx.moveTo(x, size);
-    ctx.lineTo(x + size, 0);
-    ctx.stroke();
-  }
-
-  tex.update();
-  tex.wrapU = BABYLON.Texture.WRAP_ADDRESSMODE;
-  tex.wrapV = BABYLON.Texture.WRAP_ADDRESSMODE;
-  return tex;
-}
-
 // ---------------------------------------------------------------------------
 // Cajas de simulación que viajan sobre la cinta
 // ---------------------------------------------------------------------------
-function createSimulationBoxes(scene, shadowGen) {
-  const colors = [
-    new BABYLON.Color3(0.85, 0.35, 0.25),
-    new BABYLON.Color3(0.3, 0.6, 0.85),
-    new BABYLON.Color3(0.4, 0.75, 0.4),
-  ];
+function createSimulationBoxes(scene, shadowGen, quality) {
   const boxes = [];
-  const spacing = CONVEYOR.length / colors.length;
+  const count = 3;
+  const spacing = CONVEYOR.length / count;
 
-  colors.forEach((color, i) => {
-    const size = 0.18 + (i % 2) * 0.04;
+  for (let i = 0; i < count; i++) {
+    const size = 0.16 + (i % 2) * 0.05;
     const box = BABYLON.MeshBuilder.CreateBox("simBox" + i, { size }, scene);
-    const mat = new BABYLON.StandardMaterial("simBoxMat" + i, scene);
-    mat.diffuseColor = color;
-    box.material = mat;
+    box.material = createCardboardMaterial(scene, quality, i * 15);
     box.position.set(
       -CONVEYOR.length / 2 + i * spacing + 0.3,
       CONVEYOR.topHeight + size / 2,
-      0
+      (Math.random() - 0.5) * 0.15
     );
+    box.rotation.y = (Math.random() - 0.5) * 0.3;
     shadowGen.addShadowCaster(box);
+    box.receiveShadows = true;
     boxes.push(box);
-  });
+  }
 
   return boxes;
 }
@@ -439,7 +895,8 @@ function updateSimulationBoxes(boxes, deltaX) {
 // ---------------------------------------------------------------------------
 // Inicio
 // ---------------------------------------------------------------------------
-const scene = createScene();
+let currentQuality = isMobile ? "medium" : "high";
+let scene = createScene(currentQuality);
 
 engine.runRenderLoop(() => {
   scene.render();
@@ -449,10 +906,18 @@ window.addEventListener("resize", () => {
   engine.resize();
 });
 
+const loadingEl = document.getElementById("loading");
+scene.executeWhenReady(() => {
+  loadingEl.style.opacity = "0";
+  setTimeout(() => (loadingEl.style.display = "none"), 400);
+});
+
 // --- Controles de UI ---
 const toggleBtn = document.getElementById("toggleBtn");
 const speedInput = document.getElementById("speed");
 const speedVal = document.getElementById("speedVal");
+const qualitySelect = document.getElementById("quality");
+qualitySelect.value = currentQuality;
 
 toggleBtn.addEventListener("click", () => {
   beltRunning = !beltRunning;
@@ -463,6 +928,13 @@ toggleBtn.addEventListener("click", () => {
 speedInput.addEventListener("input", () => {
   beltSpeed = parseFloat(speedInput.value);
   speedVal.textContent = beltSpeed.toFixed(1);
+});
+
+qualitySelect.addEventListener("change", () => {
+  currentQuality = qualitySelect.value;
+  const oldScene = scene;
+  scene = createScene(currentQuality);
+  oldScene.dispose();
 });
 </script>
 </body>
