@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Cinta Transportadora - Simulación Babylon.js</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    width: 100%;
+    height: 100%;
+    background: #10141a;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+  }
+  #renderCanvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+    touch-action: none;
+  }
+  #panel {
+    position: fixed;
+    top: 16px;
+    left: 16px;
+    background: rgba(20, 24, 32, 0.85);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 10px;
+    padding: 14px 18px;
+    color: #e8ecf1;
+    min-width: 240px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    backdrop-filter: blur(6px);
+  }
+  #panel h1 {
+    font-size: 15px;
+    margin: 0 0 4px 0;
+    font-weight: 600;
+  }
+  #panel .dims {
+    font-size: 12px;
+    color: #9aa5b1;
+    margin-bottom: 12px;
+  }
+  #panel label {
+    display: block;
+    font-size: 12px;
+    color: #c3cad3;
+    margin-bottom: 4px;
+  }
+  #panel .row {
+    margin-bottom: 10px;
+  }
+  #panel button {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: none;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  #toggleBtn {
+    background: #3a9e5f;
+    color: white;
+  }
+  #toggleBtn.stopped {
+    background: #b04141;
+  }
+  #speed {
+    width: 100%;
+  }
+  #speedVal {
+    color: #7fd0ff;
+    font-weight: 600;
+  }
+  #hint {
+    font-size: 11px;
+    color: #7c8593;
+    margin-top: 10px;
+    line-height: 1.4;
+  }
+</style>
+</head>
+<body>
+<canvas id="renderCanvas"></canvas>
+
+<div id="panel">
+  <h1>Cinta Transportadora</h1>
+  <div class="dims">4.0 m (largo) × 1.0 m (ancho) × 0.8 m (alto)</div>
+
+  <div class="row">
+    <button id="toggleBtn">Detener</button>
+  </div>
+
+  <div class="row">
+    <label for="speed">Velocidad: <span id="speedVal">1.0</span> m/s</label>
+    <input type="range" id="speed" min="0" max="3" step="0.1" value="1" />
+  </div>
+
+  <div id="hint">
+    Arrastra para orbitar la cámara · rueda para zoom · clic derecho para desplazar
+  </div>
+</div>
+
+<script src="vendor/babylon/babylon.js"></script>
+<script src="vendor/babylon/babylonjs.loaders.min.js"></script>
+<script>
+"use strict";
+
+const canvas = document.getElementById("renderCanvas");
+const engine = new BABYLON.Engine(canvas, true, { stencil: true, preserveDrawingBuffer: true });
+
+// ---------------------------------------------------------------------------
+// Parámetros de la cinta transportadora
+// ---------------------------------------------------------------------------
+const CONVEYOR = {
+  length: 4.0,        // eje X
+  width: 1.0,          // eje Z
+  topHeight: 0.8,       // altura de la superficie superior de la cinta desde el suelo
+  rollerRadius: 0.09,
+  legSize: 0.08,
+  guideHeight: 0.12,
+  guideThickness: 0.02,
+};
+
+let beltRunning = true;
+let beltSpeed = 1.0; // m/s (velocidad lineal aproximada de la cinta)
+
+function createScene() {
+  const scene = new BABYLON.Scene(engine);
+  scene.clearColor = new BABYLON.Color3(0.06, 0.07, 0.09);
+
+  // --- Cámara ---
+  const camera = new BABYLON.ArcRotateCamera(
+    "camera",
+    -Math.PI / 2.6,
+    Math.PI / 2.7,
+    6.5,
+    new BABYLON.Vector3(0, 0.5, 0),
+    scene
+  );
+  camera.attachControl(canvas, true);
+  camera.lowerRadiusLimit = 2;
+  camera.upperRadiusLimit = 14;
+  camera.wheelPrecision = 40;
+  camera.panningSensibility = 800;
+
+  // --- Luces ---
+  const hemi = new BABYLON.HemisphericLight("hemi", new BABYLON.Vector3(0, 1, 0), scene);
+  hemi.intensity = 0.75;
+  hemi.groundColor = new BABYLON.Color3(0.15, 0.15, 0.18);
+
+  const sun = new BABYLON.DirectionalLight("sun", new BABYLON.Vector3(-0.6, -1, 0.4), scene);
+  sun.position = new BABYLON.Vector3(5, 8, -5);
+  sun.intensity = 0.9;
+
+  const shadowGen = new BABYLON.ShadowGenerator(1024, sun);
+  shadowGen.useBlurExponentialShadowMap = true;
+  shadowGen.blurKernel = 16;
+
+  // --- Suelo ---
+  const ground = BABYLON.MeshBuilder.CreateGround("ground", { width: 12, height: 12 }, scene);
+  const groundMat = new BABYLON.StandardMaterial("groundMat", scene);
+  groundMat.diffuseColor = new BABYLON.Color3(0.18, 0.19, 0.21);
+  groundMat.specularColor = new BABYLON.Color3(0.02, 0.02, 0.02);
+  ground.material = groundMat;
+  ground.receiveShadows = true;
+
+  // Rejilla de referencia (líneas cada 0.5 m)
+  const grid = BABYLON.MeshBuilder.CreateGround("gridLines", { width: 12, height: 12, subdivisions: 24 }, scene);
+  grid.position.y = 0.001;
+  const gridMat = new BABYLON.StandardMaterial("gridMat", scene);
+  gridMat.wireframe = true;
+  gridMat.emissiveColor = new BABYLON.Color3(0.25, 0.27, 0.3);
+  gridMat.alpha = 0.25;
+  grid.material = gridMat;
+
+  // --- Grupo raíz de la cinta ---
+  const conveyorRoot = new BABYLON.TransformNode("conveyorRoot", scene);
+
+  const parts = buildConveyor(scene, shadowGen);
+  parts.forEach((m) => (m.parent = conveyorRoot));
+
+  // --- Cajas de ejemplo que se mueven sobre la cinta (para visualizar la simulación) ---
+  const boxes = createSimulationBoxes(scene, shadowGen);
+
+  // --- Loop de animación ---
+  let beltPhase = 0;
+  scene.onBeforeRenderObservable.add(() => {
+    const dt = engine.getDeltaTime() / 1000;
+    if (beltRunning) {
+      beltPhase += beltSpeed * dt;
+
+      // Girar rodillos: velocidad angular = v / r
+      const angular = beltSpeed / CONVEYOR.rollerRadius;
+      rollerMeshes.forEach((r) => r.rotate(BABYLON.Axis.Y, angular * dt, BABYLON.Space.LOCAL));
+
+      // Desplazar textura de la cinta para dar sensación de movimiento
+      if (beltMaterial.diffuseTexture) {
+        beltMaterial.diffuseTexture.uOffset += (beltSpeed * dt) / CONVEYOR.length;
+      }
+
+      // Mover cajas de simulación a lo largo de la cinta
+      updateSimulationBoxes(boxes, beltSpeed * dt);
+    }
+  });
+
+  return scene;
+}
+
+// ---------------------------------------------------------------------------
+// Construcción geométrica de la cinta transportadora
+// ---------------------------------------------------------------------------
+let rollerMeshes = [];
+let beltMaterial;
+
+function buildConveyor(scene, shadowGen) {
+  const { length, width, topHeight, rollerRadius, legSize } = CONVEYOR;
+  const meshes = [];
+
+  const centerDist = length - 2 * rollerRadius; // distancia entre centros de rodillos
+  const rollerCenterY = topHeight - rollerRadius;
+
+  // --- Material de metal (bastidor) ---
+  const frameMat = new BABYLON.StandardMaterial("frameMat", scene);
+  frameMat.diffuseColor = new BABYLON.Color3(0.25, 0.27, 0.3);
+  frameMat.specularColor = new BABYLON.Color3(0.3, 0.3, 0.3);
+  frameMat.specularPower = 32;
+
+  // --- Material de rodillos ---
+  const rollerMat = new BABYLON.StandardMaterial("rollerMat", scene);
+  rollerMat.diffuseColor = new BABYLON.Color3(0.55, 0.56, 0.58);
+  rollerMat.specularColor = new BABYLON.Color3(0.6, 0.6, 0.6);
+
+  // --- Material de la banda (goma con rayas en movimiento) ---
+  beltMaterial = new BABYLON.StandardMaterial("beltMat", scene);
+  beltMaterial.diffuseTexture = createBeltTexture(scene);
+  beltMaterial.diffuseTexture.uScale = 8;
+  beltMaterial.diffuseTexture.vScale = 1;
+  beltMaterial.specularColor = new BABYLON.Color3(0.08, 0.08, 0.08);
+
+  // --- Banda (loop tipo estadio extruido a lo ancho) ---
+  const beltShape = createStadiumProfile(centerDist, rollerRadius, 20);
+  const path = [
+    new BABYLON.Vector3(0, 0, -width / 2),
+    new BABYLON.Vector3(0, 0, width / 2),
+  ];
+  const belt = BABYLON.MeshBuilder.ExtrudeShape("belt", {
+    shape: beltShape,
+    path: path,
+    closeShape: true,
+    cap: BABYLON.Mesh.NO_CAP,
+    sideOrientation: BABYLON.Mesh.DOUBLESIDE,
+  }, scene);
+  belt.position.y = rollerCenterY;
+  belt.material = beltMaterial;
+  belt.receiveShadows = true;
+  shadowGen.addShadowCaster(belt);
+  meshes.push(belt);
+
+  // --- Rodillos (extremos) ---
+  rollerMeshes = [];
+  [-1, 1].forEach((side) => {
+    const roller = BABYLON.MeshBuilder.CreateCylinder("roller", {
+      diameter: rollerRadius * 2,
+      height: width,
+      tessellation: 24,
+    }, scene);
+    roller.rotation.x = Math.PI / 2;
+    roller.position.set((side * centerDist) / 2, rollerCenterY, 0);
+    roller.material = rollerMat;
+    roller.receiveShadows = true;
+    shadowGen.addShadowCaster(roller);
+    meshes.push(roller);
+    rollerMeshes.push(roller);
+  });
+
+  // --- Patas (4 esquinas) ---
+  const legHeight = rollerCenterY - rollerRadius;
+  const legOffsetX = centerDist / 2;
+  const legOffsetZ = width / 2 - legSize;
+  [-1, 1].forEach((sx) => {
+    [-1, 1].forEach((sz) => {
+      const leg = BABYLON.MeshBuilder.CreateBox("leg", {
+        width: legSize,
+        height: legHeight,
+        depth: legSize,
+      }, scene);
+      leg.position.set(sx * legOffsetX, legHeight / 2, sz * legOffsetZ);
+      leg.material = frameMat;
+      shadowGen.addShadowCaster(leg);
+      meshes.push(leg);
+    });
+  });
+
+  // --- Largueros longitudinales (unen las patas a lo largo) ---
+  [-1, 1].forEach((sz) => {
+    const rail = BABYLON.MeshBuilder.CreateBox("rail", {
+      width: centerDist + legSize,
+      height: legSize * 0.7,
+      depth: legSize * 0.7,
+    }, scene);
+    rail.position.set(0, legHeight * 0.55, sz * legOffsetZ);
+    rail.material = frameMat;
+    shadowGen.addShadowCaster(rail);
+    meshes.push(rail);
+  });
+
+  // --- Traviesas transversales (unen ambos lados) ---
+  [-1, 0, 1].forEach((sx) => {
+    const brace = BABYLON.MeshBuilder.CreateBox("brace", {
+      width: legSize * 0.7,
+      height: legSize * 0.7,
+      depth: width - legSize,
+    }, scene);
+    brace.position.set(sx * legOffsetX, legHeight * 0.3, 0);
+    brace.material = frameMat;
+    shadowGen.addShadowCaster(brace);
+    meshes.push(brace);
+  });
+
+  // --- Guías laterales (evitan que las cajas caigan) ---
+  const guideMat = new BABYLON.StandardMaterial("guideMat", scene);
+  guideMat.diffuseColor = new BABYLON.Color3(0.85, 0.55, 0.1);
+  guideMat.alpha = 0.85;
+  const guideY = topHeight + CONVEYOR.guideHeight / 2;
+  [-1, 1].forEach((sz) => {
+    const guide = BABYLON.MeshBuilder.CreateBox("guide", {
+      width: length,
+      height: CONVEYOR.guideHeight,
+      depth: CONVEYOR.guideThickness,
+    }, scene);
+    guide.position.set(0, guideY, sz * (width / 2));
+    guide.material = guideMat;
+    shadowGen.addShadowCaster(guide);
+    meshes.push(guide);
+  });
+
+  return meshes;
+}
+
+// Genera el perfil 2D en forma de "pista de atletismo" (estadio) que envuelve
+// dos rodillos de radio `radius` separados `centerDist` entre centros.
+function createStadiumProfile(centerDist, radius, segments) {
+  const pts = [];
+  const half = centerDist / 2;
+
+  // borde superior recto (de derecha a izquierda)
+  pts.push(new BABYLON.Vector3(half, radius, 0));
+  pts.push(new BABYLON.Vector3(-half, radius, 0));
+
+  // semicírculo izquierdo (90° -> 270°)
+  for (let i = 0; i <= segments; i++) {
+    const a = Math.PI / 2 + (Math.PI * i) / segments;
+    pts.push(new BABYLON.Vector3(-half + radius * Math.cos(a), radius * Math.sin(a), 0));
+  }
+
+  // borde inferior recto (de izquierda a derecha)
+  pts.push(new BABYLON.Vector3(-half, -radius, 0));
+  pts.push(new BABYLON.Vector3(half, -radius, 0));
+
+  // semicírculo derecho (-90° -> 90°)
+  for (let i = 0; i <= segments; i++) {
+    const a = -Math.PI / 2 + (Math.PI * i) / segments;
+    pts.push(new BABYLON.Vector3(half + radius * Math.cos(a), radius * Math.sin(a), 0));
+  }
+
+  return pts;
+}
+
+// Textura procedural con rayas diagonales para dar sensación de movimiento a la banda
+function createBeltTexture(scene) {
+  const size = 256;
+  const tex = new BABYLON.DynamicTexture("beltTex", { width: size, height: size }, scene, false);
+  const ctx = tex.getContext();
+
+  ctx.fillStyle = "#1b1b1d";
+  ctx.fillRect(0, 0, size, size);
+
+  ctx.strokeStyle = "#333336";
+  ctx.lineWidth = 10;
+  const step = 32;
+  for (let x = -size; x < size * 2; x += step) {
+    ctx.beginPath();
+    ctx.moveTo(x, size);
+    ctx.lineTo(x + size, 0);
+    ctx.stroke();
+  }
+
+  tex.update();
+  tex.wrapU = BABYLON.Texture.WRAP_ADDRESSMODE;
+  tex.wrapV = BABYLON.Texture.WRAP_ADDRESSMODE;
+  return tex;
+}
+
+// ---------------------------------------------------------------------------
+// Cajas de simulación que viajan sobre la cinta
+// ---------------------------------------------------------------------------
+function createSimulationBoxes(scene, shadowGen) {
+  const colors = [
+    new BABYLON.Color3(0.85, 0.35, 0.25),
+    new BABYLON.Color3(0.3, 0.6, 0.85),
+    new BABYLON.Color3(0.4, 0.75, 0.4),
+  ];
+  const boxes = [];
+  const spacing = CONVEYOR.length / colors.length;
+
+  colors.forEach((color, i) => {
+    const size = 0.18 + (i % 2) * 0.04;
+    const box = BABYLON.MeshBuilder.CreateBox("simBox" + i, { size }, scene);
+    const mat = new BABYLON.StandardMaterial("simBoxMat" + i, scene);
+    mat.diffuseColor = color;
+    box.material = mat;
+    box.position.set(
+      -CONVEYOR.length / 2 + i * spacing + 0.3,
+      CONVEYOR.topHeight + size / 2,
+      0
+    );
+    shadowGen.addShadowCaster(box);
+    boxes.push(box);
+  });
+
+  return boxes;
+}
+
+function updateSimulationBoxes(boxes, deltaX) {
+  const limit = CONVEYOR.length / 2 - 0.1;
+  boxes.forEach((box) => {
+    box.position.x += deltaX;
+    if (box.position.x > limit) {
+      box.position.x = -limit;
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Inicio
+// ---------------------------------------------------------------------------
+const scene = createScene();
+
+engine.runRenderLoop(() => {
+  scene.render();
+});
+
+window.addEventListener("resize", () => {
+  engine.resize();
+});
+
+// --- Controles de UI ---
+const toggleBtn = document.getElementById("toggleBtn");
+const speedInput = document.getElementById("speed");
+const speedVal = document.getElementById("speedVal");
+
+toggleBtn.addEventListener("click", () => {
+  beltRunning = !beltRunning;
+  toggleBtn.textContent = beltRunning ? "Detener" : "Iniciar";
+  toggleBtn.classList.toggle("stopped", !beltRunning);
+});
+
+speedInput.addEventListener("input", () => {
+  beltSpeed = parseFloat(speedInput.value);
+  speedVal.textContent = beltSpeed.toFixed(1);
+});
+</script>
+</body>
+</html>
